@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from minideepinfer.models.deepseek_v41.model import GroupedExperts
+from minideepinfer.models.deepseek_v41.model import Gate, GroupedExperts
 
 pytestmark = pytest.mark.gpu
 
@@ -126,3 +126,19 @@ def test_chunked_dequant_writes_the_stack_in_place():
     assert w.dtype == torch.bfloat16 and w.shape == (N_EXPERTS, CFG.dim, CFG.moe_inter_dim)
     for i in (0, N_EXPERTS - 1):
         torch.testing.assert_close(w[i], experts.experts[i].w1.dequant().T, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("score_func", ["sqrtsoftplus", "sigmoid", "softmax"])
+def test_bf16_gate_matches_fp32_gate(score_func):
+    # V4.1-Flash gate shape. The bf16 inputs are exact in fp32, so only the accumulation order differs.
+    cfg = SimpleNamespace(dim=5120, n_routed_experts=384, n_activated_experts=6, score_func=score_func,
+                          route_scale=1.5)
+    torch.manual_seed(0)
+    gate = Gate(cfg)
+    gate.weight.data = (torch.randn_like(gate.weight) * cfg.dim**-0.5).bfloat16()  # bf16 weight, fp32 bias
+    gate.bias.data = torch.randn_like(gate.bias) * 1e-2
+    x = torch.randn(300, cfg.dim).bfloat16()
+    expected_weights, expected_indices = gate(x)  # the fp32 path, on CPU
+    weights, indices = gate.cuda()(x.cuda())
+    torch.testing.assert_close(indices.cpu(), expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(weights.cpu(), expected_weights, rtol=1e-4, atol=1e-5)

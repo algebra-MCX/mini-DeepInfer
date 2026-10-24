@@ -678,7 +678,11 @@ class Gate(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
-        scores = F.linear(x.float(), self.weight.float())
+        if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
+            # Tensor-core bf16 GEMM with fp32 output, as in DeepInfer; the fp32 GEMM runs on SIMT cores.
+            scores = torch.mm(x, self.weight.t(), out_dtype=torch.float32)
+        else:
+            scores = F.linear(x.float(), self.weight.float())
         if cfg.score_func == "softmax":
             scores = scores.softmax(-1)
         elif cfg.score_func == "sigmoid":
