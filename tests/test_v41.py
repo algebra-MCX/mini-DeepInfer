@@ -83,8 +83,7 @@ def test_sparse_attention_matches_kernel(ref):
     idx = torch.randint(-1, N, (1, T, K), device="cuda", dtype=torch.int32)
     idx[0, 0] = -1  # a query with no visible key must produce zeros
     expected = ref.sparse_attn(q, kv, sink, idx, D**-0.5)[0]
-    keys = kv[0][idx[0].clamp_min(0).long()]
-    ours = sparse_attention(q[0], keys, idx[0] >= 0, sink, D**-0.5)
+    ours = sparse_attention(q[0], [(kv[0], idx[0])], sink, D**-0.5)
     torch.testing.assert_close(ours.float(), expected.float(), atol=2e-2, rtol=2e-2)
     assert ours[0].abs().max() == 0
 

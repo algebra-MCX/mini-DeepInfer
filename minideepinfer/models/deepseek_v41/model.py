@@ -36,7 +36,6 @@ from minideepinfer.models.deepseek_v41.quant import fp4_fake_quant, fp8_fake_qua
 from minideepinfer.models.deepseek_v41.weights import BLOCK, dequant_fp4, dequant_fp8
 
 PAGE_TOKENS = 128  # Positions covered by one KV cache block (the reference's 128-token store granularity).
-ATTN_QUERY_CHUNK = 256  # Queries per gathered attention slice; bounds the [T, keys, head_dim] buffer.
 INDEX_QUERY_CHUNK = 512  # Queries per indexer scoring slice; bounds the [T, heads, entries] buffer.
 DEQUANT_CHUNK_VALUES = 2**28  # Weights dequantized at once (1 GiB in fp32); bounds the temporaries of an expert stack.
 
@@ -116,10 +115,7 @@ class V41Cache:
 class StepContext:
     """Per-forward values shared across layers."""
 
-    win_chunk_idx: torch.Tensor  # [T, window] flat token index of each window key in this step's batch
-    win_ring_idx: torch.Tensor  # [T, window] flat ring index of each window key in the cache
-    win_from_chunk: torch.Tensor  # [T, window] bool: key computed this step (else read from the ring)
-    win_valid: torch.Tensor  # [T, window] bool: key position >= 0
+    win_idx: torch.Tensor  # [T, window] int32 row of each window key in [ring | this step's kv], -1 = none
     ring_write_idx: torch.Tensor  # [T] flat ring index each token is written to; slot 0 if it leaves the window
     topk: dict[int, torch.Tensor] = field(default_factory=dict)  # index-source layer -> [T, k] entry ids, -1 = none
     candidates: torch.Tensor | None = None  # [T, n] bool, from the candidate-source layer's indexer
@@ -131,19 +127,20 @@ def paged_entry(block_tables: torch.Tensor, rows, entry: torch.Tensor, ratio: in
     return block_tables[rows, entry * ratio // PAGE_TOKENS] * entries + entry % entries
 
 
-def build_step_context(batch: V41Batch, window: int) -> StepContext:
+def build_step_context(batch: V41Batch, window: int, ring_rows: int) -> StepContext:
+    """`ring_rows` is the size of one layer's flat ring; this step's kv rows follow it in the window table."""
     pos = batch.positions
     t = torch.arange(pos.numel(), device=pos.device)
     j = torch.arange(window, device=pos.device)
     key_pos = pos[:, None] - (window - 1) + j
+    from_chunk = ring_rows + t[:, None] - (window - 1) + j  # keys computed this step
+    from_ring = batch.slots[:, None] * window + key_pos.remainder(window)  # keys of earlier steps
+    win_idx = torch.where(key_pos >= batch.chunk_start[:, None], from_chunk, from_ring)
     # Only the last `window` tokens of each chunk survive in the ring; the others are written to the
     # reserved slot 0, which keeps the shapes fixed (no boolean indexing, so no host sync).
     keep = pos >= batch.chunk_end - window
     return StepContext(
-        win_chunk_idx=(t[:, None] - (window - 1) + j).clamp_min(0),
-        win_ring_idx=batch.slots[:, None] * window + key_pos.remainder(window),
-        win_from_chunk=key_pos >= batch.chunk_start[:, None],
-        win_valid=key_pos >= 0,
+        win_idx=torch.where(key_pos >= 0, win_idx, -1).int(),
         ring_write_idx=torch.where(keep, batch.slots, 0) * window + pos.remainder(window),
     )
 
@@ -206,16 +203,20 @@ def rope_tail(x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool
 
 
 def sparse_attention(
-    q: torch.Tensor, kv: torch.Tensor, valid: torch.Tensor, sink: torch.Tensor, scale: float
+    q: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor, scale: float
 ) -> torch.Tensor:
-    """Multi-query attention over gathered keys, with a per-head sink in the denominator.
+    """Multi-query attention with a per-head sink in the denominator, reading keys through row indices.
 
-    q [T, H, D], kv [T, K, D] (keys double as values), valid [T, K]. A row with no valid key yields 0.
+    q [T, H, D]; each source is a KV table [N, D] (keys double as values) and the rows [T, K] of it each
+    query attends to, -1 marking an empty slot. A query with no key yields 0.
     """
-    if (q.is_cuda and all(x.is_contiguous() for x in (q, kv, valid, sink))
-            and q.dtype == kv.dtype == torch.bfloat16 and valid.dtype == torch.bool
-            and sink.dtype == torch.float32 and 0 < q.shape[-1] <= 512 and kv.shape[1] > 0):
-        return sparse_attention_cuda(q, kv, valid, sink, scale)
+    if (q.is_cuda and len(sources) <= 2 and q.dtype == torch.bfloat16 and sink.dtype == torch.float32
+            and all(x.is_contiguous() for x in (q, sink, *(t for src in sources for t in src)))
+            and all(kv.dtype == torch.bfloat16 and idx.dtype == torch.int32 for kv, idx in sources)
+            and 0 < q.shape[-1] <= 512):
+        return sparse_attention_cuda(q, sources, sink, scale)
+    kv = torch.cat([kv[idx.clamp_min(0)] for kv, idx in sources], dim=1)
+    valid = torch.cat([idx >= 0 for _, idx in sources], dim=1)
     s = torch.einsum("thd,tkd->thk", q.float(), kv.float()) * scale
     s = s.masked_fill(~valid[:, None, :], float("-inf"))
     m = s.amax(-1).clamp_min(-1e30)
@@ -502,8 +503,8 @@ class Attention(nn.Module):
 
     def _compressed(
         self, x: torch.Tensor, qr: torch.Tensor, batch: V41Batch, cache: V41Cache, ctx: StepContext
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Flat cache ids [T, k] of the selected compressed keys and their validity.
+    ) -> torch.Tensor:
+        """Rows [T, k] int32 of the selected keys in the compressed cache, -1 = none.
 
         A KV-source layer first writes this step's compressed entries (and indexer keys) to the cache.
         """
@@ -524,7 +525,8 @@ class Attention(nn.Module):
         if self.is_index_source:
             ctx.topk[self.layer_id] = self.indexer(x, qr, self.freqs[batch.positions], batch, cache, ctx)
         idx = ctx.topk[cfg.index_source_of(self.layer_id)]
-        return paged_entry(batch.block_tables, batch.token_seq[:, None], idx.clamp_min(0), r), idx >= 0
+        rows = paged_entry(batch.block_tables, batch.token_seq[:, None], idx.clamp_min(0), r)
+        return torch.where(idx >= 0, rows, -1).int()
 
     def forward(self, x: torch.Tensor, batch: V41Batch, cache: V41Cache, ctx: StepContext) -> torch.Tensor:
         T = x.size(0)
@@ -533,23 +535,14 @@ class Attention(nn.Module):
         q = rope_tail(self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim)), freqs, self.rope_dim)
         kv = fp8_fake_quant(rope_tail(self.kv_norm(self.wkv(x)), freqs, self.rope_dim))
 
+        # Key tables, as FlashMLA's key_cache / key_cache_extra: the window reads [ring | this step's kv],
+        # a compressed layer also reads its source's compressed cache.
         ring = cache.window[self.layer_id].view(-1, self.head_dim)
+        sources = [(torch.cat([ring, kv]), ctx.win_idx)]
         if self.ratio:
-            comp_flat, comp_valid = self._compressed(x, qr, batch, cache, ctx)
-            comp_kv = cache.comp_kv[self.cfg.kv_source_of(self.layer_id)]
-
-        # Keys are gathered per query slice: the full [T, keys, head_dim] buffer would not fit for long chunks.
-        o = torch.empty_like(q)
-        for start in range(0, T, ATTN_QUERY_CHUNK):
-            rows = slice(start, start + ATTN_QUERY_CHUNK)
-            keys = torch.where(
-                ctx.win_from_chunk[rows, :, None], kv[ctx.win_chunk_idx[rows]], ring[ctx.win_ring_idx[rows]]
-            )
-            valid = ctx.win_valid[rows]
-            if self.ratio:
-                keys = torch.cat([keys, comp_kv[comp_flat[rows]]], dim=1)
-                valid = torch.cat([valid, comp_valid[rows]], dim=1)
-            o[rows] = sparse_attention(q[rows], keys, valid, self.attn_sink, self.scale)
+            comp_idx = self._compressed(x, qr, batch, cache, ctx)
+            sources.append((cache.comp_kv[self.cfg.kv_source_of(self.layer_id)], comp_idx))
+        o = sparse_attention(q, sources, self.attn_sink, self.scale)
         ring[ctx.ring_write_idx] = kv
 
         o = rope_tail(o, freqs, self.rope_dim, inverse=True)
@@ -831,7 +824,8 @@ class DeepseekV41(nn.Module):
 
     def forward(self, batch: V41Batch) -> torch.Tensor:
         assert self.cache is not None, "KV cache not allocated"
-        ctx = build_step_context(batch, self.cfg.window_size)
+        ring_rows = self.cache.window.shape[1] * self.cfg.window_size  # slots * window
+        ctx = build_step_context(batch, self.cfg.window_size, ring_rows)
         hashes = self.hasher(batch.ngram_ids) if self.hasher is not None else None
         h = self.embed(batch.input_ids).unsqueeze(1).repeat(1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), self.cfg.hc_mult, device=h.device)
